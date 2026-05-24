@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import date, datetime
 from typing import Dict, List, Optional
 
@@ -49,7 +49,8 @@ class RegisterUser(BaseModel):
     referred_by_code: str | None = None 
 
     # ✅ Age validation (FIXED for precise date comparison)
-    @validator("date_of_birth")
+    @field_validator("date_of_birth")
+    @classmethod
     def validate_age(cls, v):
         today = date.today()
         # Checks if the birthday has occurred yet this year
@@ -90,6 +91,10 @@ class UpdateUser(BaseModel):
     state: str | None = None
     relationship_type: str | None = None
     account_created_by: str | None = None
+    # TWO LINES for Near Me functionality:
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
 
 
 class LoginUser(BaseModel):
@@ -182,7 +187,8 @@ class WalletInfo(BaseModel):
 class ProfileVisibilityUpdate(BaseModel):
     profile_visibility: str  # "public" | "matches_only" | "premium_only"
 
-    @validator("profile_visibility")
+    @field_validator("profile_visibility")
+    @classmethod
     def validate_visibility(cls, v):
         allowed = {"public", "matches_only", "premium_only"}
         if v not in allowed:
@@ -238,3 +244,155 @@ class SupportTicketOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordConfirm(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=6) # Matches your registration min_length
+
+# =====================================================================
+# ACCOUNT DEACTIVATION & DELETION SCHEMAS
+# =====================================================================
+
+class DeactivateAccountRequest(BaseModel):
+    """Request to deactivate account (no password needed for deactivation)"""
+    reason: str | None = None  # Optional reason for deactivation
+
+class DeleteAccountRequest(BaseModel):
+    """Request to permanently delete account (password required for verification)"""
+    password: str = Field(min_length=1)  # Password for verification
+    reason: str | None = None  # Optional reason for deletion
+
+class DeactivatedAccountOut(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    first_name: str
+    last_name: str
+    deactivation_date: datetime
+    reactivation_deadline: datetime
+    reason: str | None
+    
+    class Config:
+        from_attributes = True
+
+class DeletedAccountOut(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    first_name: str
+    last_name: str
+    deletion_date: datetime
+    reason: str | None
+    
+    class Config:
+        from_attributes = True
+
+class ReactivateAccountResponse(BaseModel):
+    """Response when account is reactivated"""
+    message: str
+    user_id: int
+    email: str
+    status: str  # "reactivated"
+
+# -------------------------------------------Admin Starts Here ----------------------------------------------------- 
+
+class AdminCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    email: EmailStr
+    password: str = Field(min_length=6)
+    is_superadmin: bool = False
+
+class AdminLogin(BaseModel):
+    username: str
+    password: str
+
+class AdminOut(BaseModel):
+    id: int
+    username: str
+    email: str
+    is_superadmin: bool
+
+    class Config:
+        from_attributes = True
+
+class AdminDashboardStats(BaseModel):
+    total_users: int
+    active_subscriptions: int
+    banned_users: int
+    total_reports: int
+
+class AdminUserList(BaseModel):
+    id: int
+    first_name: str
+    last_name: str
+    email: str
+    mobile_no: str
+    plan_type: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class ReportDetailsOut(BaseModel):
+    id: int
+    reporter_id: int
+    reporter_name: str
+    reported_user_id: int
+    reported_user_name: str
+    reason: str
+    description: str | None = None
+    source: str = "chat"
+    status: str = "pending"
+    severity_score: int = 1
+    admin_notes: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# =====================================================================
+# REPORT SYSTEM SCHEMAS
+# =====================================================================
+
+class ReportCreate(BaseModel):
+    reported_user_id: int
+    reason: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    source: str = Field(default="chat", max_length=50)  # chat / profile / message
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v):
+        allowed = {
+            "Fake Profile", "Spam", "Harassment", "Scam/Fraud",
+            "Religious Misrepresentation", "Inappropriate Content", "Other"
+        }
+        if v not in allowed:
+            raise ValueError(f"Reason must be one of: {', '.join(allowed)}")
+        return v
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, v):
+        allowed = {"chat", "profile", "message"}
+        if v not in allowed:
+            raise ValueError(f"Source must be one of: {', '.join(allowed)}")
+        return v
+
+class AdminReportAction(BaseModel):
+    action: str = Field(min_length=1)  # resolve / dismiss / under_review / ban / warn / delete_account
+    admin_notes: str | None = None
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, v):
+        allowed = {"resolve", "dismiss", "under_review", "ban", "warn", "delete_account"}
+        if v not in allowed:
+            raise ValueError(f"Action must be one of: {', '.join(allowed)}")
+        return v

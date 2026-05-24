@@ -1,8 +1,23 @@
 import os
 import ssl
+import socket
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
+
+# ── DNS Monkeypatch for Local Network Resolution Issues ──
+_original_getaddrinfo = socket.getaddrinfo
+
+def _custom_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if host in [
+        "ep-purple-band-a8vclc37-pooler.eastus2.azure.neon.tech",
+        "ep-purple-band-a8vclc37.eastus2.azure.neon.tech"
+    ]:
+        return _original_getaddrinfo("52.167.188.143", port, family, type, proto, flags)
+    return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+socket.getaddrinfo = _custom_getaddrinfo
+# ──────────────────────────────────────────────────────────
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Load .env.local ONLY for local development
 if os.getenv("ENV") != "production":
@@ -51,7 +66,7 @@ engine = create_async_engine(
     pool_pre_ping=True,
 )
 
-SessionLocal = sessionmaker(
+SessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,

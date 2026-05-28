@@ -2,6 +2,14 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import date, datetime
 from typing import Dict, List, Optional
 
+class AadhaarInitRequest(BaseModel):
+    aadhaar_number: str
+    # Note: no mobile field needed — UIDAI sends OTP to the mobile registered with this Aadhaar
+
+class AadhaarVerifyRequest(BaseModel):
+    ref_id: str
+    otp: str
+
 class RegisterUser(BaseModel):
     # Required
     first_name: str = Field(min_length=2, max_length=50)
@@ -299,7 +307,6 @@ class ReactivateAccountResponse(BaseModel):
     status: str  # "reactivated"
 
 # -------------------------------------------Admin Starts Here ----------------------------------------------------- 
-
 class AdminCreate(BaseModel):
     username: str = Field(min_length=3, max_length=50)
     email: EmailStr
@@ -345,54 +352,4 @@ class ReportDetailsOut(BaseModel):
     reported_user_id: int
     reported_user_name: str
     reason: str
-    description: str | None = None
-    source: str = "chat"
-    status: str = "pending"
-    severity_score: int = 1
-    admin_notes: str | None = None
-    resolved_at: datetime | None = None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-# =====================================================================
-# REPORT SYSTEM SCHEMAS
-# =====================================================================
-
-class ReportCreate(BaseModel):
-    reported_user_id: int
-    reason: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
-    source: str = Field(default="chat", max_length=50)  # chat / profile / message
-
-    @field_validator("reason")
-    @classmethod
-    def validate_reason(cls, v):
-        allowed = {
-            "Fake Profile", "Spam", "Harassment", "Scam/Fraud",
-            "Religious Misrepresentation", "Inappropriate Content", "Other"
-        }
-        if v not in allowed:
-            raise ValueError(f"Reason must be one of: {', '.join(allowed)}")
-        return v
-
-    @field_validator("source")
-    @classmethod
-    def validate_source(cls, v):
-        allowed = {"chat", "profile", "message"}
-        if v not in allowed:
-            raise ValueError(f"Source must be one of: {', '.join(allowed)}")
-        return v
-
-class AdminReportAction(BaseModel):
-    action: str = Field(min_length=1)  # resolve / dismiss / under_review / ban / warn / delete_account
-    admin_notes: str | None = None
-
-    @field_validator("action")
-    @classmethod
-    def validate_action(cls, v):
-        allowed = {"resolve", "dismiss", "under_review", "ban", "warn", "delete_account"}
-        if v not in allowed:
-            raise ValueError(f"Action must be one of: {', '.join(allowed)}")
-        return v

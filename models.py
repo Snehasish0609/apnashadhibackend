@@ -32,6 +32,9 @@ class User(Base):
     account_created_by = Column(String, nullable=True)  # NEW: Self / Parents
     terms_accepted = Column(Boolean, default=False, nullable=False, server_default="false")  # NEW
     is_active = Column(Boolean, default=True, nullable=False, server_default="true")  # Auto-activate by default
+    is_aadhaar_verified = Column(Boolean, default=False, nullable=False, server_default="false")
+    is_selfie_verified = Column(Boolean, default=False, nullable=False, server_default="false")
+    face_embedding = Column(Text, nullable=True)  # JSON array of 128 floats (face-api.js descriptor)
 
     # Preferences
     preferred_min_age = Column(Integer, nullable=True)

@@ -1,3 +1,4 @@
+from fastapi import HTTPException
 import httpx
 import random
 import string
@@ -9,7 +10,32 @@ from sqlalchemy import select, update, func, and_, or_
 from models import User, Message, Referral, Transaction, SupportTicket, BlockedUser, DeactivatedAccount, DeletedAccount, OTPCode
 from auth import hash_password, verify_password
 from models import Admin, Report
+from sqlalchemy import func, cast, Date, select
 PG_SECRET = os.getenv("PG_SECRET_KEY", "Apnashaadi.in123")
+
+# crud.py (Update your sanitize_user_dict function)
+
+def sanitize_user_dict(user):
+    return {
+        "id": user.id,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "profile_id": user.profile_id,
+        "profile_pic": user.profile_pic,
+        "gender": user.gender,
+        "looking_for": user.looking_for,
+        "city": user.city,
+        "state": user.state,
+        "latitude": user.latitude,
+        "longitude": user.longitude,
+        "religion": user.religion,
+        "profession": user.profession,
+        "profile_visibility": user.profile_visibility,
+        "date_of_birth": user.date_of_birth.isoformat() if user.date_of_birth else None,
+        
+        # 🔥 ADD THIS LINE SO REACT KNOWS THEIR STATUS:
+        "is_aadhaar_verified": getattr(user, 'is_aadhaar_verified', False)
+    }
 
 # =====================
 # SECURE DATA HELPERS
@@ -25,7 +51,12 @@ def sanitize_user_dict(u):
     # Re-attach the plaintext string if it was decrypted during the query
     if hasattr(u, 'email'): data['email'] = u.email
     if hasattr(u, 'mobile_no'): data['mobile_no'] = u.mobile_no
+    # ✅ Explicitly include aadhaar verification status (ensure it's never missing)
+    data['is_aadhaar_verified'] = getattr(u, 'is_aadhaar_verified', False)
+    data['is_selfie_verified'] = getattr(u, 'is_selfie_verified', False)
+    data.pop('face_embedding', None)   # Never expose raw biometric data to frontend
     return data
+
 
 async def get_user_by_id(db: AsyncSession, user_id: int):
     """Fetches user and decrypts email and mobile on the fly."""
@@ -565,34 +596,13 @@ async def create_admin_user(db: AsyncSession, admin_data):
 async def authenticate_admin(db: AsyncSession, username: str, password: str):
     result = await db.execute(select(Admin).where(Admin.username == username.lower().strip()))
     admin = result.scalars().first()
-    if not admin or not verify_password(password, str(admin.password)):  # type: ignore[arg-type]
+    if not admin or not verify_password(password, admin.password):
         return None
     return admin
 
 # --- ADMIN DASHBOARD DATA ---
-async def get_admin_dashboard_stats(db: AsyncSession):
-    # Total Users
-    total_users_res = await db.execute(select(func.count(User.id)))
-    total_users = total_users_res.scalar() or 0
 
-    # Active Subscriptions (assuming 'free' is no sub)
-    active_subs_res = await db.execute(select(func.count(User.id)).where(User.plan_type != 'free'))
-    active_subs = active_subs_res.scalar() or 0
 
-    # Banned Users
-    banned_res = await db.execute(select(func.count(User.id)).where(User.is_active == False))
-    banned_users = banned_res.scalar() or 0
-
-    # Total Reports
-    reports_res = await db.execute(select(func.count(Report.id)))
-    total_reports = reports_res.scalar() or 0
-
-    return {
-        "total_users": total_users,
-        "active_subscriptions": active_subs,
-        "banned_users": banned_users,
-        "total_reports": total_reports
-    }
 
 async def get_all_users_for_admin(db: AsyncSession):
     """Fetches all users with decrypted PII for the admin table"""
@@ -604,6 +614,7 @@ async def get_all_users_for_admin(db: AsyncSession):
             func.pgp_sym_decrypt(User.email_encrypted, PG_SECRET).label("email"),
             func.pgp_sym_decrypt(User.mobile_encrypted, PG_SECRET).label("mobile_no"),
             User.plan_type,
+            User.gender,
             User.is_active,
             User.created_at
         ).order_by(User.created_at.desc())
@@ -621,51 +632,224 @@ async def toggle_user_ban_status(db: AsyncSession, user_id: int):
     await db.refresh(user)
     return user
 
-def calculate_severity_score(reason: str) -> int:
-    reason_map = {
-        "Scam/Fraud": 5,
-        "Harassment": 5,
-        "Inappropriate Content": 4,
-        "Fake Profile": 3,
-        "Religious Misrepresentation": 3,
-        "Spam": 2,
-        "Other": 1
-    }
-    return reason_map.get(reason, 1)
-
-async def check_duplicate_report(db: AsyncSession, reporter_id: int, target_user_id: int) -> bool:
-    res = await db.execute(
-        select(Report).where(
-            Report.reporter_id == reporter_id,
-            Report.reported_user_id == target_user_id,
-            Report.status == "pending"
-        )
-    )
-    return res.scalars().first() is not None
-
 async def get_all_reports_for_admin(db: AsyncSession):
     result = await db.execute(
-        select(Report).order_by(Report.created_at.desc())
+        select(
+            Report.id,
+            Report.reporter_id,
+            Report.reported_user_id,
+            Report.reason,
+            Report.created_at
+        ).order_by(Report.created_at.desc())
     )
-    reports = result.scalars().all()
+    reports = result.all()
     
     detailed_reports = []
     for r in reports:
-        reporter = await get_user_by_id(db, int(r.reporter_id))  # type: ignore[arg-type]
-        reported = await get_user_by_id(db, int(r.reported_user_id))  # type: ignore[arg-type]
+        reporter = await get_user_by_id(db, r.reporter_id)
+        reported = await get_user_by_id(db, r.reported_user_id)
         detailed_reports.append({
             "id": r.id,
             "reporter_id": r.reporter_id,
-            "reporter_name": f"{reporter.first_name} {reporter.last_name}" if reporter else f"User #{r.reporter_id}",
+            "reporter_name": f"{reporter.first_name} {reporter.last_name}" if reporter else "Unknown",
             "reported_user_id": r.reported_user_id,
-            "reported_user_name": f"{reported.first_name} {reported.last_name}" if reported else f"User #{r.reported_user_id}",
+            "reported_user_name": f"{reported.first_name} {reported.last_name}" if reported else "Unknown",
             "reason": r.reason,
-            "description": r.description,
-            "source": r.source,
-            "status": r.status,
-            "severity_score": r.severity_score,
-            "admin_notes": r.admin_notes,
-            "resolved_at": r.resolved_at,
             "created_at": r.created_at
         })
     return detailed_reports
+
+async def get_admin_user_profile_details(db, user_id: int):
+
+    result = await db.execute(
+        select(
+            User,
+
+            func.pgp_sym_decrypt(
+                User.email_encrypted,
+                PG_SECRET
+            ).label("email"),
+
+            func.pgp_sym_decrypt(
+                User.mobile_encrypted,
+                PG_SECRET
+            ).label("mobile_no"),
+        ).where(User.id == user_id)
+    )
+
+    row = result.first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = row[0]
+
+    # ✅ decrypted values
+    email = row.email
+    mobile_no = row.mobile_no
+
+    return {
+        "id": user.id,
+
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+
+        "email": email,
+        "mobile_no": mobile_no,
+
+        "gender": user.gender,
+        "city": user.city,
+        "state": user.state,
+
+        "date_of_birth": str(user.date_of_birth) if user.date_of_birth else None,
+
+        "religion": user.religion,
+        "caste": user.caste,
+        "height": user.height,
+
+        "education": user.education,
+        "profession": user.profession,
+        "annual_income": user.annual_income,
+
+        "marital_status": user.marital_status,
+        "mother_tongue": user.mother_tongue,
+
+        "bio": user.bio,
+
+        "plan_type": user.plan_type,
+        "profile_completed": user.profile_completed,
+
+        "is_active": user.is_active,
+        "is_online": user.is_online,
+
+        "created_at": str(user.created_at) if user.created_at else None,
+        "last_seen": str(user.last_seen) if user.last_seen else None,
+
+        "profile_pic": user.profile_pic,
+    }
+    
+async def get_admin_dashboard_stats(db: AsyncSession):
+    # Total Users
+    total_users_res = await db.execute(
+        select(func.count(User.id))
+    )
+    total_users = total_users_res.scalar() or 0
+
+    # Active Subscriptions
+    active_subs_res = await db.execute(
+        select(func.count(User.id))
+        .where(User.plan_type != 'free')
+    )
+    active_subs = active_subs_res.scalar() or 0
+
+    # Banned Users
+    banned_res = await db.execute(
+        select(func.count(User.id))
+        .where(User.is_active == False)
+    )
+    banned_users = banned_res.scalar() or 0
+
+    # Total Reports
+    reports_res = await db.execute(
+        select(func.count(Report.id))
+    )
+    total_reports = reports_res.scalar() or 0
+
+    # =========================
+    # DAILY USER GROWTH
+    # =========================
+    daily_users_res = await db.execute(
+        select(
+            cast(User.created_at, Date).label("date"),
+            func.count(User.id).label("users")
+        )
+        .group_by(cast(User.created_at, Date))
+        .order_by(cast(User.created_at, Date))
+    )
+
+    daily_user_growth = [
+        {
+            "date": str(row.date),
+            "users": row.users
+        }
+        for row in daily_users_res.all()
+    ]
+
+    # ====================================
+    # NEW: GENDER CHART DATA
+    # ====================================
+    male_users_res = await db.execute(
+        select(func.count(User.id))
+        .where(func.lower(User.gender) == "male")
+    )
+    female_users_res = await db.execute(
+        select(func.count(User.id))
+        .where(func.lower(User.gender) == "female")
+    )
+    other_users_res = await db.execute(
+        select(func.count(User.id))
+        .where(
+            ~func.lower(User.gender).in_(["male", "female"])
+        )
+    )
+
+    male_users = male_users_res.scalar() or 0
+    female_users = female_users_res.scalar() or 0
+    other_users = other_users_res.scalar() or 0
+
+    gender_stats = [
+        {
+            "name": "Male",
+            "value": male_users
+        },
+        {
+            "name": "Female",
+            "value": female_users
+        },
+        {
+            "name": "Other",
+            "value": other_users
+        }
+    ]
+
+    # =========================
+    # RETURN
+    # =========================
+    return {
+        "total_users": total_users,
+        "active_subscriptions": active_subs,
+        "banned_users": banned_users,
+        "total_reports": total_reports,
+        "daily_user_growth": daily_user_growth,
+        # ✅ NEW
+        "gender_stats": gender_stats
+    }
+    
+    
+# ==========================================
+# ADMIN SETTINGS DATA
+# ==========================================
+
+async def get_admin_settings_data(db: AsyncSession):
+
+    result = await db.execute(
+        select(Admin).order_by(Admin.id.desc())
+    )
+
+    admin = result.scalars().first()
+
+    if not admin:
+        raise HTTPException(
+            status_code=404,
+            detail="Admin not found"
+        )
+
+    return {
+        "admin_name": admin.username,
+        "admin_email": admin.email,
+        "created_date": str(admin.created_at) if admin.created_at else None,
+
+        # TEMP STATIC
+        # later update from login history table
+        "last_login": "Recently Logged In"
+    }

@@ -4,6 +4,10 @@ import shutil
 import os
 import random
 import string
+import httpx 
+
+from pydantic import BaseModel
+from schemas import AadhaarInitRequest, AadhaarVerifyRequest
 
 from contextlib import asynccontextmanager
 
@@ -41,7 +45,9 @@ from crud import (
     delete_account_permanently,
     get_user_by_id,          # 🔥 ADDED
     sanitize_user_dict,      # 🔥 ADDED
-    PG_SECRET
+    PG_SECRET,
+    get_admin_settings_data
+
 )
 from auth import create_access_token, get_current_user, verify_password, hash_password
 # Add to schemas import:
@@ -55,6 +61,10 @@ from crud import (
 
 # Add to auth import:
 from auth import get_current_admin
+
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # =====================
 # IN-MEMORY GEOCODE CACHE
@@ -97,10 +107,24 @@ async def lifespan(app_instance: FastAPI):
         print("Connected to DB:", result.scalar())
         await conn.run_sync(Base.metadata.create_all)
         print("Database tables ensured!")
+
+        # ── Safe column migrations (ALTER TABLE ... ADD COLUMN IF NOT EXISTS) ──
+        # These run on every startup but are no-ops if the column already exists.
+        migrations = [
+            # Aadhaar KYC verification
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_aadhaar_verified BOOLEAN NOT NULL DEFAULT false;",
+            # Selfie / face verification
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_selfie_verified BOOLEAN NOT NULL DEFAULT false;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS face_embedding TEXT;",
+        ]
+        for sql in migrations:
+            await conn.execute(text(sql))
+        print("Column migrations applied!")
+
     yield  # App runs here
 
-app = FastAPI(lifespan=lifespan)
 
+app=FastAPI(lifespan=lifespan)
 
 # =====================
 # CORS
@@ -205,6 +229,244 @@ async def login_bypass_active(
 
     token = create_access_token(user.id)
     return {"access_token": token, "user_id": user.id}
+
+# =====================================================================
+# AADHAAR VERIFICATION — Real UIDAI OTP via Setu KYC API
+# =====================================================================
+# How it works:
+#   1. User enters their 12-digit Aadhaar number
+#   2. We call Setu's API → Setu calls UIDAI → UIDAI sends OTP to the
+#      mobile number that the user registered with their Aadhaar
+#   3. We store Setu's refId in DB
+#   4. User enters OTP → we call Setu verify with refId → Setu confirms with UIDAI
+#   5. On success → mark user as is_aadhaar_verified = True
+#
+# Setup (takes ~5 minutes):
+#   1. Sign up free at https://bridge.setu.co
+#   2. Go to Products → Aadhaar Validation → Aadhaar OTP Validation → Enable Sandbox
+#   3. Copy CLIENT_ID, CLIENT_SECRET, PRODUCT_INSTANCE_ID into .env.local
+#   4. To go live: complete KYC with Setu and switch to production credentials
+# =====================================================================
+
+SETU_CLIENT_ID           = os.getenv("SETU_CLIENT_ID", "")
+SETU_CLIENT_SECRET       = os.getenv("SETU_CLIENT_SECRET", "")
+SETU_PRODUCT_INSTANCE_ID = os.getenv("SETU_PRODUCT_INSTANCE_ID", "")
+# Sandbox: https://dg.setu.co  |  Production: https://dg.setu.co (same URL, different credentials)
+SETU_BASE_URL            = os.getenv("SETU_BASE_URL", "https://dg.setu.co")
+
+
+def _setu_headers() -> dict:
+    return {
+        "x-client-id": SETU_CLIENT_ID,
+        "x-client-secret": SETU_CLIENT_SECRET,
+        "x-product-instance-id": SETU_PRODUCT_INSTANCE_ID,
+        "Content-Type": "application/json",
+    }
+
+
+def _setu_configured() -> bool:
+    return bool(SETU_CLIENT_ID and SETU_CLIENT_SECRET and SETU_PRODUCT_INSTANCE_ID)
+
+
+@app.post("/verification/aadhaar/send-otp")
+async def init_aadhaar_verification(
+    data: AadhaarInitRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    # 1. Validate Aadhaar format
+    aadhaar = data.aadhaar_number.strip()
+    if len(aadhaar) != 12 or not aadhaar.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid Aadhaar number. Must be exactly 12 digits.")
+
+    # 2. Check Setu is configured
+    if not _setu_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Aadhaar verification service is not configured. "
+                "Please set SETU_CLIENT_ID, SETU_CLIENT_SECRET and SETU_PRODUCT_INSTANCE_ID "
+                "in your .env.local. Get free sandbox credentials at https://bridge.setu.co"
+            )
+        )
+
+    # 3. Get user
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.is_aadhaar_verified:
+        raise HTTPException(status_code=400, detail="Your Aadhaar is already verified.")
+
+    # 4. Call Setu → Setu calls UIDAI → OTP sent to Aadhaar-registered mobile
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{SETU_BASE_URL}/api/v2/aadhaar-validation/aadhaar-otp/generate",
+                headers=_setu_headers(),
+                json={"aadhaar": aadhaar},
+            )
+    except httpx.RequestError as e:
+        print(f"[Setu] Network error: {e}")
+        raise HTTPException(status_code=503, detail="Could not reach verification service. Please try again.")
+
+    if resp.status_code not in (200, 201):
+        err = resp.json()
+        detail = err.get("message") or err.get("error") or "Failed to initiate Aadhaar verification."
+        print(f"[Setu] send-otp error {resp.status_code}: {err}")
+        raise HTTPException(status_code=400, detail=detail)
+
+    setu_data = resp.json()
+    ref_id = setu_data.get("refId") or setu_data.get("data", {}).get("refId", "")
+    if not ref_id:
+        raise HTTPException(status_code=502, detail="Verification service returned an unexpected response.")
+
+    print(f"[Setu] ✅ OTP triggered for Aadhaar ...{aadhaar[-4:]} — refId: {ref_id}")
+
+    # 5. Store refId in otp_codes table (keyed to user email, expires in 10 min)
+    #    The otp_code field stores Setu's refId so we can retrieve it in the verify step.
+    await db.execute(
+        text(
+            "UPDATE otp_codes SET is_used = true "
+            "WHERE pgp_sym_decrypt(email_encrypted, :secret) = :email AND is_used = false"
+        ),
+        {"secret": PG_SECRET, "email": user.email}
+    )
+    new_otp = OTPCode(
+        email_encrypted=func.pgp_sym_encrypt(user.email, PG_SECRET),
+        otp_code=ref_id,                                          # ← stores Setu refId
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        is_used=False,
+    )
+    db.add(new_otp)
+    await db.commit()
+
+    return {
+        "message": "OTP sent to the mobile number registered with your Aadhaar by UIDAI. Check your phone.",
+        "ref_id": "stored",   # ref_id is stored server-side; frontend doesn't need it
+    }
+
+
+@app.post("/verification/aadhaar/verify")
+async def verify_aadhaar_otp(
+    data: AadhaarVerifyRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    if not _setu_configured():
+        raise HTTPException(status_code=503, detail="Aadhaar verification service is not configured.")
+
+    # 1. Get user
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.is_aadhaar_verified:
+        raise HTTPException(status_code=400, detail="Aadhaar is already verified.")
+
+    # 2. Retrieve the stored Setu refId from DB
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(OTPCode).where(
+            func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == user.email,
+            OTPCode.is_used == False,
+            OTPCode.expires_at > now,
+        ).order_by(OTPCode.created_at.desc()).limit(1)
+    )
+    otp_record = result.scalars().first()
+
+    if not otp_record:
+        raise HTTPException(
+            status_code=400,
+            detail="Verification session expired. Please click 'Get OTP' again."
+        )
+
+    ref_id = otp_record.otp_code   # The Setu refId stored in the generate step
+
+    # 3. Call Setu → Setu verifies OTP with UIDAI
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{SETU_BASE_URL}/api/v2/aadhaar-validation/aadhaar-otp/verify",
+                headers=_setu_headers(),
+                json={"otp": data.otp.strip(), "refId": ref_id},
+            )
+    except httpx.RequestError as e:
+        print(f"[Setu] Network error during verify: {e}")
+        raise HTTPException(status_code=503, detail="Could not reach verification service. Please try again.")
+
+    if resp.status_code not in (200, 201):
+        err = resp.json()
+        detail = err.get("message") or err.get("error") or "Invalid OTP. Please check and try again."
+        print(f"[Setu] verify error {resp.status_code}: {err}")
+        raise HTTPException(status_code=400, detail=detail)
+
+    # 4. Success — mark OTP as used and user as verified
+    otp_record.is_used = True
+    user.is_aadhaar_verified = True
+    await db.commit()
+
+    print(f"[Setu] ✅ User {user_id} ({user.first_name}) Aadhaar verified successfully via UIDAI.")
+
+    return {
+        "message": "Aadhaar verified successfully! Your profile now shows a verified badge. 🛡️",
+        "is_aadhaar_verified": True
+    }
+
+
+
+# =====================================================================
+# SELFIE / FACE VERIFICATION
+# =====================================================================
+
+class SelfieVerifyRequest(BaseModel):
+    descriptor: list[float]   # 128-element face descriptor from face-api.js
+
+@app.post("/verification/selfie")
+async def verify_selfie(
+    data: SelfieVerifyRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    import numpy as np, json
+
+    if len(data.descriptor) != 128:
+        raise HTTPException(status_code=400, detail="Invalid face descriptor. Expected 128 values.")
+
+    incoming = np.array(data.descriptor, dtype=np.float64)
+    norm = np.linalg.norm(incoming)
+    if norm == 0:
+        raise HTTPException(status_code=400, detail="Face descriptor is empty. Please retake your selfie.")
+    incoming = incoming / norm
+
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.is_selfie_verified:
+        return {"message": "Your selfie is already verified! ✅", "is_selfie_verified": True}
+
+    # Compare against stored reference if one exists
+    if user.face_embedding:
+        stored = np.array(json.loads(user.face_embedding), dtype=np.float64)
+        stored_norm = np.linalg.norm(stored)
+        if stored_norm > 0:
+            stored = stored / stored_norm
+        distance = float(np.linalg.norm(incoming - stored))
+        print(f"[Selfie] User {user_id} face distance: {distance:.4f}")
+        if distance > 0.5:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Face did not match (score={distance:.2f}). Please ensure good lighting and try again."
+            )
+        user.is_selfie_verified = True
+        await db.commit()
+        return {"message": "Selfie verified! Your profile now shows a verified badge. 📸", "is_selfie_verified": True}
+
+    # First capture — store as reference AND mark verified
+    user.face_embedding = json.dumps(data.descriptor)
+    user.is_selfie_verified = True
+    await db.commit()
+    print(f"[Selfie] User {user_id} selfie stored and verified.")
+    return {"message": "Selfie verified successfully! Your profile now shows a verified badge. 📸", "is_selfie_verified": True}
+
 
 # =====================
 # GET MY PROFILE 🔥
@@ -2731,112 +2993,161 @@ async def get_deactivation_status(
 # 🛡️ ADMIN SYSTEM ROUTES
 # =====================================================================
 
+
+from crud import (
+    create_admin_user,
+    authenticate_admin,
+    get_admin_dashboard_stats,
+    get_all_users_for_admin,
+    toggle_user_ban_status,
+    get_all_reports_for_admin,
+    get_admin_user_profile_details
+)
+
 @app.post("/admin/register", response_model=AdminOut, tags=["Admin System"])
-async def register_admin(data: AdminCreate, db: AsyncSession = Depends(get_db)):
-    from models import Admin # Imported here to avoid circular imports if any
-    
-    existing = await db.execute(select(Admin).where(Admin.username == data.username.lower()))
+async def register_admin(
+    data: AdminCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    from models import Admin
+
+    existing = await db.execute(
+        select(Admin).where(
+            Admin.username == data.username.lower()
+        )
+    )
+
     if existing.scalars().first():
-        raise HTTPException(status_code=400, detail="Admin username already exists")
-    
+        raise HTTPException(
+            status_code=400,
+            detail="Admin username already exists"
+        )
+
     return await create_admin_user(db, data)
 
+
 @app.post("/admin/login", tags=["Admin System"])
-async def login_admin(data: AdminLogin, db: AsyncSession = Depends(get_db)):
-    admin = await authenticate_admin(db, data.username, data.password)
+async def login_admin(
+    data: AdminLogin,
+    db: AsyncSession = Depends(get_db)
+):
+    admin = await authenticate_admin(
+        db,
+        data.username,
+        data.password
+    )
+
     if not admin:
-        raise HTTPException(status_code=401, detail="Invalid admin credentials")
-    
-    # 🔥 Generate a token specifically with the 'admin' role
-    token = create_access_token(int(admin.id), role="admin")  # type: ignore[arg-type] 
-    
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials"
+        )
+
+    token = create_access_token(
+        admin.id,
+        role="admin"
+    )
+
     return {
-        "access_token": token, 
-        "admin_id": admin.id, 
+        "access_token": token,
+        "admin_id": admin.id,
         "username": admin.username,
         "is_superadmin": admin.is_superadmin
     }
 
+
 @app.get("/admin/dashboard/stats", tags=["Admin System"])
 async def admin_dashboard_stats(
-    db: AsyncSession = Depends(get_db), 
-    admin_id: int = Depends(get_current_admin) # Protects route from regular users
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin)
 ):
     return await get_admin_dashboard_stats(db)
 
+
 @app.get("/admin/users", tags=["Admin System"])
 async def admin_list_users(
-    db: AsyncSession = Depends(get_db), 
+    db: AsyncSession = Depends(get_db),
     admin_id: int = Depends(get_current_admin)
 ):
     return await get_all_users_for_admin(db)
 
+
+@app.get("/admin/users/{user_id}", tags=["Admin System"])
+async def admin_user_profile_details(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin)
+):
+    return await get_admin_user_profile_details(db, user_id)
+
+
 @app.post("/admin/users/{target_id}/toggle-ban", tags=["Admin System"])
 async def admin_toggle_ban(
-    target_id: int, 
-    db: AsyncSession = Depends(get_db), 
+    target_id: int,
+    db: AsyncSession = Depends(get_db),
     admin_id: int = Depends(get_current_admin)
 ):
     user = await toggle_user_ban_status(db, target_id)
+
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
     status_text = "unbanned" if user.is_active else "banned"
-    return {"message": f"User successfully {status_text}", "is_active": user.is_active}
+
+    return {
+        "message": f"User successfully {status_text}",
+        "is_active": user.is_active
+    }
+
 
 @app.get("/admin/reports", tags=["Admin System"])
 async def admin_list_reports(
-    db: AsyncSession = Depends(get_db), 
+    db: AsyncSession = Depends(get_db),
     admin_id: int = Depends(get_current_admin)
 ):
     return await get_all_reports_for_admin(db)
 
-@app.post("/admin/reports/{report_id}/action", tags=["Admin System"])
-async def admin_report_action(
-    report_id: int,
-    payload: AdminReportAction,
+
+@app.get("/admin/user/{user_id}/profile-overview", tags=["Admin System"])
+async def admin_user_profile_overview(
+    user_id: int,
     db: AsyncSession = Depends(get_db),
     admin_id: int = Depends(get_current_admin)
 ):
-    from models import Report
-    from crud import delete_account_permanently, get_user_by_id
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalars().first()
     
-    # Fetch report
-    res = await db.execute(select(Report).where(Report.id == report_id))
-    report = res.scalars().first()
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
         
-    action = payload.action
-    report.admin_notes = payload.admin_notes  # type: ignore[assignment]
+    txn_result = await db.execute(select(Transaction).where(Transaction.user_id == user_id))
+    txns = txn_result.scalars().all()
+    
+    total_coins = sum(t.amount for t in txns if t.amount > 0)
+    earned_profile = sum(t.amount for t in txns if t.amount > 0 and ("profile" in t.description.lower() or "completion" in t.description.lower()))
+    earned_actions = total_coins - earned_profile
+    
+    return {
+        "coin": {
+            "total_coins": total_coins,
+            "available_coins": user.coin_balance or 0,
+            "earned_from_profile_completion": earned_profile,
+            "earned_from_actions": earned_actions
+        }
+    }
+# ==========================================
+# ADMIN SETTINGS
+# ==========================================
 
-    if action == "resolve":
-        report.status = "resolved"  # type: ignore[assignment]
-        report.resolved_at = datetime.now()  # type: ignore[assignment]
-    elif action == "dismiss":
-        report.status = "dismissed"  # type: ignore[assignment]
-        report.resolved_at = datetime.now()  # type: ignore[assignment]
-    elif action == "under_review":
-        report.status = "under_review"  # type: ignore[assignment]
-    elif action == "ban":
-        # Ban the reported user
-        user = await get_user_by_id(db, int(report.reported_user_id))  # type: ignore[arg-type]
-        if user:
-            user.is_active = False  # type: ignore[assignment]
-        report.status = "resolved"  # type: ignore[assignment]
-        report.resolved_at = datetime.now()  # type: ignore[assignment]
-    elif action == "warn":
-        report.status = "resolved"  # type: ignore[assignment]
-        report.resolved_at = datetime.now()  # type: ignore[assignment]
-        # Mock sending email warning to user
-        print(f"[WARN] Warning sent to User #{report.reported_user_id} for {report.reason}")
-    elif action == "delete_account":
-        # Delete user permanently
-        await delete_account_permanently(db, int(report.reported_user_id), reason=f"Account deleted due to Report #{report_id}")  # type: ignore[arg-type]
-        report.status = "resolved"  # type: ignore[assignment]
-        report.resolved_at = datetime.now()  # type: ignore[assignment]
+@app.get("/admin/settings")
+async def admin_settings(
+    db: AsyncSession = Depends(get_db)
+):
+    return await get_admin_settings_data(db)
 
-    await db.commit()
-    return {"message": f"Successfully performed action '{action}' on report #{report_id}"}
+
 
 # Safety & Moderation Pipeline Integrity Verified
